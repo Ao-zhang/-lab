@@ -6,7 +6,7 @@
  * @School: SJTU
  * @Date: 2021-03-05 13:44:31
  * @LastEditors: Seven
- * @LastEditTime: 2021-03-11 09:38:36
+ * @LastEditTime: 2021-03-13 10:58:46
  */
 /*
  * FILE: rdt_receiver.cc
@@ -36,15 +36,24 @@
 using namespace std;
 
 #define MAX_WINDOW_SIZE 10
-#define HEADER_SIZE 4
+#define HEADER_SIZE 5
 #define MAX_SEQ 60
+#define A_CONST 7
 #define MAX_PAYLOAD_SIZE (RDT_PKTSIZE - HEADER_SIZE)
 
+/*
+*包头设计：
+*   |<- checksum ->|<-payload size->|<-sequence number->|<- a constant ->|
+*   |<-  2 byte  ->|<-   1 byte   ->|<-     1 byte    ->|<-   1 byte   ->|
+*/
+
+//自定义收到的packet结构体，reciever端中windows的单元
 struct RecievePacket
 {
     bool recieved = false;
     char *data = NULL;
     int size = 0;
+    char seq = 0;
     bool if_head = false; //是否是一个msg的头
     bool if_tail = false; //是否是一个msg的尾
     RecievePacket() {}
@@ -61,26 +70,40 @@ struct RecievePacket
 static int window_cursor;
 static RecievePacket windows[MAX_WINDOW_SIZE]; //packet 缓存，窗口大小与sender一致
 static message cur_Msg;                        //当前正在合并的message信息
+static char expect_seq;                        //期待的最小的序号
+
+/**
+ * @description: 增加sequence number
+ * @param {char} &seq
+ * @return {*}
+ * @author: Zhang Ao
+ */
+static void Seq_increase(char &seq)
+{
+    seq = (seq + 1) % MAX_SEQ;
+}
 
 static void flush_Msg()
 {
+    assert(cur_Msg.data);
+    assert(cur_Msg.size);
     Receiver_ToUpperLayer(&cur_Msg);
-    if (cur_Msg.data)
-    {
-        free(cur_Msg.data);
-        cur_Msg.data = NULL;
-        cur_Msg.size = 0;
-    }
+    free(cur_Msg.data);
+    cur_Msg.data = NULL;
+    cur_Msg.size = 0;
 }
 
-short checksum(struct packet *p)
+/**
+ * @description: 因特网校验码验算方法
+ * @param {struct packet} *p
+ * @return {*}
+ * @author: Zhang Ao
+ */
+static short checksum(struct packet *p)
 {
-    printf("reciever checksum\n");
     unsigned long c_sum = 0;
-    int size = p->data[2];       //有效载荷大小
-    if (size >= RDT_PKTSIZE - 4) //size大小出错，返回0
-        return 0;
-    for (int i = 2; i < size + 4; i += 2) //除去checksum位的数据，其他位的数据每两个byte求和
+    int size = p->data[2];                   //有效载荷大小
+    for (int i = 2; i < RDT_PKTSIZE; i += 2) //除去checksum位的数据，其他位的数据每两个byte求和
     {
         c_sum += *(short *)(&p->data[i]);
     }
@@ -92,7 +115,10 @@ short checksum(struct packet *p)
 /* receiver initialization, called once at the very beginning */
 void Receiver_Init()
 {
+    cur_Msg.data = NULL;
+    cur_Msg.size = 0;
     window_cursor = 0;
+    expect_seq = 0;
     fprintf(stdout, "At %.2fs: receiver initializing ...\n", GetSimulationTime());
 }
 
@@ -112,104 +138,100 @@ void Receiver_Final()
             windows[i].data = NULL;
         }
     }
+    if (cur_Msg.data)
+    {
+        free(cur_Msg.data);
+        cur_Msg.data = NULL;
+    }
     fprintf(stdout, "At %.2fs: receiver finalizing ...\n", GetSimulationTime());
 }
 
-//移动windows时，将packet合并成message信息并向上抛出
+/**
+ * @description: 移动windows时，将packet合并成message信息并向上抛出
+ * @param {structRecievePacket} *p
+ * @return {*}
+ * @author: Zhang Ao
+ */
 void Reciever_AddtoMsg(struct RecievePacket *p)
 {
-    printf("reciever add to msg\n");
-
+    printf("\treciever add to msg ——seq=%d\n", p->seq);
+    assert(p->seq == expect_seq);
+    assert(p->recieved && p->data);
+    if (p->seq == 0)
+    {
+        printf("\t\t attention！\n");
+    }
     if (p->if_head) //message头部
     {
-        assert(cur_Msg.data == NULL && cur_Msg.size == 0); //之前的那个message包已经上抛了；
+        //来了一个新的message的信息，上一个message必须已经被flush掉了
+        assert(cur_Msg.data == NULL && cur_Msg.size == 0);
         int new_size = p->size;
         cur_Msg.data = (char *)malloc(new_size);
         memcpy(cur_Msg.data, p->data, new_size);
         cur_Msg.size = new_size;
         if (p->if_tail)
         { //同时也是尾部，上抛并重置msg
+            printf("\treciever combined one message with seq=%d, and size=%d\n", p->seq, cur_Msg.size);
             flush_Msg();
         }
     }
-    else if (p->if_tail) //尾部
+    else
     {
         assert(cur_Msg.data && cur_Msg.size > 0);
-
-        //拼接message，准备上抛
-        message new_message;
-        int total_size;
-        new_message.data = (char *)malloc(total_size)
-                               cur_Msg.data = (char *)realloc(cur_Msg.data, new_size);
+        //拼接message
+        int new_size = cur_Msg.size + p->size;
+        cur_Msg.data = (char *)realloc(cur_Msg.data, new_size);
         memcpy(cur_Msg.data + cur_Msg.size, p->data, p->size);
+        cur_Msg.size = new_size;
+        if (p->if_tail)
+        {
+            printf("\treciever combined one message with seq=%d, and size=%d\n", p->seq, cur_Msg.size);
+            flush_Msg();
+        }
     }
+    //清空packet
+    if (p->data)
+    {
+        free(p->data);
+        p->data = NULL;
+    }
+    p->recieved = false;
+    Seq_increase(expect_seq);
+    printf("\treciever: \twaiting for seq=%d\n", expect_seq);
 }
 
-//此处seq只含有低6位bit
-void Reicever_SendACK(char seq)
+/**
+ * @description: 发送ack包
+ * @param {char} seq
+ * @return {*}
+ * @author: Zhang Ao
+ */
+void Reicever_SendACK(char seq) //此处seq只含有低6位bit
 {
     printf("reciever send ack seq=%d\n", seq);
     assert(seq >> 6 == 0);
     packet ack;
     ack.data[2] = 0;
     ack.data[3] = seq;
+    ack.data[4] = A_CONST;
     *(short *)ack.data = checksum(&ack);
     Receiver_ToLowerLayer(&ack);
-}
-
-//清空message缓存
-void Reciever_SendMsg()
-{
-    printf("reciever send msg to upper\n");
-    MsgBuffer *msg_b = buffers.front();
-    while (msg_b && msg_b->if_combined)
-    {
-        message *m = (message *)malloc(sizeof(message));
-        m->size = msg_b->size;
-        m->data = (char *)malloc(m->size);
-        // m->data = msg_b->data; //选择共用地址，因为会malloc一个相同的地址
-        memcpy(m->data, msg_b->data, m->size);
-        // assert(m->data != msg_b->data);
-        //似乎在传上去之后，m->data就会被free
-        Receiver_ToUpperLayer(m);
-
-        if (msg_b->data)
-        {
-            free(msg_b->data);
-            msg_b->data = NULL;
-        }
-        if (msg_b)
-        {
-            free(msg_b);
-            msg_b = NULL;
-        }
-        if (m->data)
-        {
-            free(m->data);
-            m->data = NULL;
-        }
-        if (m)
-        {
-            free(m);
-            m = NULL;
-        }
-        buffers.pop_front();
-        msg_b = buffers.front();
-    }
 }
 
 /* event handler, called when a packet is passed from the lower layer at the 
    receiver */
 void Receiver_FromLowerLayer(struct packet *pkt)
 {
-
-    printf("reciever from lower\n");
     //检验校验码
     short sum = *(short *)(pkt->data);
-    if (sum != checksum(pkt))
+    if (sum != checksum(pkt) || pkt->data[4] != A_CONST)
         return;
+
     char seq = pkt->data[3] & 63; //取低位6个bit
+
     char size = pkt->data[2];
+    if (seq < 0 || seq >= 60 || size <= 0 || size > MAX_PAYLOAD_SIZE)
+        return;
     printf("recieve from low——get pkt seq=%d\n", seq);
     // printf("recieve from low——get pkt size=%d\n", size);
     //看看是否是一个msg的头或者尾
@@ -218,16 +240,24 @@ void Receiver_FromLowerLayer(struct packet *pkt)
 
     //校验码通过，发送ack
     Reicever_SendACK(seq);
-
-    //如果已经接收过了
-    if (windows[seq % MAX_WINDOW_SIZE].recieved)
+    //最大只能是expect_seq+9,下面的表达式考虑了seq最大只能是59
+    int difference = seq - expect_seq;
+    if ((difference >= -50 && difference < 0) || difference >= 10)
     {
-        Reciever_SendMsg();
+        printf("\t\t\t didn't modify 1 and waiting for seq=%d\n", expect_seq);
         return;
     }
 
-    RecievePacket *p = (RecievePacket *)malloc(sizeof(RecievePacket));
+    RecievePacket *p = &windows[seq % MAX_WINDOW_SIZE];
+    if (p->recieved) //收到过了，直接返回
+    {
+        assert(p->data);
+        return;
+    }
+    //还没收到
+    assert(p->data == NULL);
     p->if_head = if_head;
+    p->seq = seq;
     p->if_tail = if_tail;
     p->recieved = true;
     p->data = (char *)malloc(size);
@@ -254,10 +284,4 @@ void Receiver_FromLowerLayer(struct packet *pkt)
         //移动window指针
         window_cursor = (window_cursor + i) % MAX_WINDOW_SIZE;
     }
-    //没有收到过，但也不是windows中的首位,直接将当前packet加入windows
-    else
-    {
-        windows[seq % MAX_WINDOW_SIZE] = *p;
-    }
-    Reciever_SendMsg();
 }
